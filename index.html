@@ -1,0 +1,828 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Pixel Region Image Exporter</title>
+<style>
+  :root { --ui-bg:#111; --ui-fg:#eee; --accent:#4ad; }
+  * { box-sizing:border-box; }
+  body { margin:0; font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif; background:#0b0b0b; color:var(--ui-fg); }
+  header { padding:16px 18px 8px; }
+  h1 { margin:0 0 8px; font-size:20px; letter-spacing:.2px; }
+  .sub { color:#bbb; font-size:13px; }
+  #controls { display:grid; gap:12px; grid-template-columns:repeat(auto-fit,minmax(260px,1fr)); padding:0 18px 14px; }
+  .card { background:var(--ui-bg); border:1px solid #1f1f1f; border-radius:10px; padding:14px; }
+  .label { font-size:12px; color:#bbb; margin-bottom:6px; }
+  input[type="number"]{
+    width:100%; padding:8px 10px; border-radius:8px;
+    border:1px solid #222; background:#181818; color:var(--ui-fg);
+  }
+  button{
+    appearance:none; border:1px solid #233; border-radius:10px;
+    padding:10px 12px; background:#17212b; color:#e9f4ff; cursor:pointer; font-weight:600;
+  }
+  button:hover{ filter:brightness(1.08); }
+  button.secondary{ background:#1a1a1a; color:#ddd; border-color:#2a2a2a; }
+  button:disabled{ opacity:.5; cursor:not-allowed; }
+  .row{ display:flex; gap:10px; flex-wrap:wrap; }
+  .grow{ flex:1 1 auto; }
+  #drop{
+    border:2px dashed #2b2b2b; border-radius:12px; padding:18px; text-align:center;
+    background:#121212; color:#ccc; transition:border-color .15s ease, background .15s ease; cursor:pointer;
+  }
+  #drop.drag{ border-color:var(--accent); background:#0e1620; color:#e3f2ff; }
+  canvas.preview, img.preview{ width:100%; background:#101010; border-radius:8px; border:1px solid #222; display:block; }
+  .note{ color:#aaa; font-size:12px; margin-top:6px; }
+</style>
+</head>
+<body>
+  <header>
+    <h1>Pixel Region Image Exporter</h1>
+    <div class="sub">Uses the same compact multi-seed region-generation method as your fixed region-number generator, but exports only fill-bucket-friendly blank and colored region PNGs.</div>
+  </header>
+
+  <section id="controls">
+    <div class="card">
+      <div id="drop">
+        <strong>Drop an image here</strong><br/>or click to choose
+        <input id="file" type="file" accept="image/*" style="display:none" />
+      </div>
+      <div class="note">The blank and colored region outputs preserve the input image aspect ratio.</div>
+    </div>
+
+    <div class="card">
+      <div class="row">
+        <div class="grow">
+          <div class="label">Number of pixels across</div>
+          <input id="cols" type="number" min="4" max="160" step="1" value="24" />
+        </div>
+        <div class="grow">
+          <div class="label">Number of pixels down</div>
+          <input id="rows" type="number" min="4" max="160" step="1" value="24" />
+        </div>
+      </div>
+
+      <div class="row">
+        <div class="grow">
+          <div class="label">Number of colors to use</div>
+          <input id="kcolors" type="number" min="2" max="12" step="1" value="2" />
+        </div>
+        <div class="grow">
+          <div class="label">Approx. Region Size (cells)</div>
+          <input id="targetRegion" type="number" min="1" max="500" step="1" value="4" />
+        </div>
+      </div>
+
+      <div class="row">
+        <div class="grow">
+          <div class="label">Region Randomness / Wobbliness (0–100)</div>
+          <input id="regionRandomness" type="number" min="0" max="100" step="1" value="40" />
+        </div>
+        <div class="grow">
+          <div class="label">Border thickness in exported PNGs (pixels)</div>
+          <input id="borderPx" type="number" min="1" max="8" step="1" value="2" />
+        </div>
+      </div>
+
+      <div class="row">
+        <button id="btnPixelate" class="grow">Pixelate</button>
+        <button id="btnGenerate" class="grow">Generate Region Images</button>
+      </div>
+
+      <div class="row">
+        <button id="btnDownloadBlank" class="grow secondary" disabled>Download Blank PNG</button>
+        <button id="btnDownloadColored" class="grow secondary" disabled>Download Colored PNG</button>
+      </div>
+
+      <div class="note">Exports use flat solid fills and pure black borders drawn on integer pixels for easy Paint bucket-fill behavior.</div>
+    </div>
+
+    <div class="card">
+      <div class="label">Original (fit)</div>
+      <canvas id="origCanvas" class="preview"></canvas>
+    </div>
+
+    <div class="card">
+      <div class="label">Pixelated preview</div>
+      <canvas id="pixCanvas" class="preview"></canvas>
+      <div class="note">Preview shows a light grid only for reference. Exported images include only region boundaries.</div>
+    </div>
+
+    <div class="card">
+      <div class="label">Blank region image preview</div>
+      <img id="blankPreview" class="preview" alt="blank region preview" />
+    </div>
+
+    <div class="card">
+      <div class="label">Colored region image preview</div>
+      <img id="coloredPreview" class="preview" alt="colored region preview" />
+    </div>
+  </section>
+
+<script>
+(() => {
+  let img = new Image();
+  let imgLoaded = false;
+
+  const colsEl = document.getElementById('cols');
+  const rowsEl = document.getElementById('rows');
+  const kEl = document.getElementById('kcolors');
+  const targetRegionEl = document.getElementById('targetRegion');
+  const randomnessEl = document.getElementById('regionRandomness');
+  const borderPxEl = document.getElementById('borderPx');
+
+  const origCanvas = document.getElementById('origCanvas');
+  const pixCanvas = document.getElementById('pixCanvas');
+  const octx = origCanvas.getContext('2d');
+  const pctx = pixCanvas.getContext('2d');
+  octx.imageSmoothingEnabled = true;
+  pctx.imageSmoothingEnabled = false;
+
+  const blankPreviewImg = document.getElementById('blankPreview');
+  const coloredPreviewImg = document.getElementById('coloredPreview');
+  const btnDownloadBlank = document.getElementById('btnDownloadBlank');
+  const btnDownloadColored = document.getElementById('btnDownloadColored');
+
+  let gridW = 0, gridH = 0;
+  let cellColors = [];
+  let palette = [];
+  let indices = [];
+  let blocks = [];
+  let cellToBlock = [];
+  let blankURL = '';
+  let coloredURL = '';
+
+  const clamp = (v,a,b) => Math.max(a, Math.min(b, v|0));
+  const rgbToHex = (r,g,b) => '#' + [r,g,b].map(x => x.toString(16).padStart(2,'0')).join('');
+  const lin = (x,y)=> y*gridW + x;
+  const unlin = (i)=> [i%gridW, (i/gridW|0)];
+
+  function drawOrigFit() {
+    if (!imgLoaded) { octx.clearRect(0,0,origCanvas.width,origCanvas.height); return; }
+    const maxW = 600;
+    const scale = Math.min(1, maxW / img.width);
+    origCanvas.width = Math.round(img.width * scale);
+    origCanvas.height = Math.round(img.height * scale);
+    octx.clearRect(0,0,origCanvas.width,origCanvas.height);
+    octx.drawImage(img, 0, 0, origCanvas.width, origCanvas.height);
+  }
+
+  function sampleToGrid(w, h) {
+    gridW = clamp(w, 4, 256);
+    gridH = clamp(h, 4, 256);
+
+    const tmp = document.createElement('canvas');
+    tmp.width = img.width;
+    tmp.height = img.height;
+    const tctx = tmp.getContext('2d', { willReadFrequently: true });
+    tctx.drawImage(img, 0, 0);
+
+    const data = tctx.getImageData(0, 0, img.width, img.height).data;
+    cellColors = new Array(gridW * gridH);
+
+    const stepX = img.width / gridW;
+    const stepY = img.height / gridH;
+
+    for (let y = 0; y < gridH; y++) {
+      for (let x = 0; x < gridW; x++) {
+        const cx = Math.min(img.width - 1, Math.floor((x + 0.5) * stepX));
+        const cy = Math.min(img.height - 1, Math.floor((y + 0.5) * stepY));
+        const idx = (cy * img.width + cx) * 4;
+        const r = data[idx], g = data[idx + 1], b = data[idx + 2];
+        cellColors[y * gridW + x] = { r, g, b };
+      }
+    }
+  }
+
+  function clusterQuantize(maxColors, tolerance = 25) {
+    const clusters = [];
+    for (const pix of cellColors) {
+      let found = false;
+      for (const cl of clusters) {
+        const dr = pix.r - cl.r;
+        const dg = pix.g - cl.g;
+        const db = pix.b - cl.b;
+        const dist = Math.sqrt(dr*dr + dg*dg + db*db);
+        if (dist < tolerance) {
+          cl.r = (cl.r * cl.count + pix.r) / (cl.count + 1);
+          cl.g = (cl.g * cl.count + pix.g) / (cl.count + 1);
+          cl.b = (cl.b * cl.count + pix.b) / (cl.count + 1);
+          cl.count++;
+          found = true;
+          break;
+        }
+      }
+      if (!found) clusters.push({ r: pix.r, g: pix.g, b: pix.b, count: 1 });
+    }
+
+    function distance(a, b) {
+      const dr = a.r - b.r, dg = a.g - b.g, db = a.b - b.b;
+      return dr*dr + dg*dg + db*db;
+    }
+
+    while (clusters.length > maxColors) {
+      let minD = Infinity, ai = 0, bi = 1;
+      for (let i = 0; i < clusters.length; i++) {
+        for (let j = i + 1; j < clusters.length; j++) {
+          const d = distance(clusters[i], clusters[j]);
+          if (d < minD) { minD = d; ai = i; bi = j; }
+        }
+      }
+      const a = clusters[ai], b = clusters[bi];
+      const total = a.count + b.count;
+      a.r = (a.r * a.count + b.r * b.count) / total;
+      a.g = (a.g * a.count + b.g * b.count) / total;
+      a.b = (a.b * a.count + b.b * b.count) / total;
+      a.count = total;
+      clusters.splice(bi, 1);
+    }
+
+    const pal = clusters.map(c => {
+      const R = Math.round(c.r), G = Math.round(c.g), B = Math.round(c.b);
+      const hex = rgbToHex(R, G, B);
+      const lum = 0.2126 * R + 0.7152 * G + 0.0722 * B;
+      return { r:R, g:G, b:B, hex, lum };
+    }).sort((a, b) => a.lum - b.lum);
+
+    indices = new Array(cellColors.length);
+    for (let i = 0; i < cellColors.length; i++) {
+      const p = cellColors[i];
+      let best = 0, bd = Infinity;
+      for (let c = 0; c < pal.length; c++) {
+        const d = (p.r-pal[c].r)**2 + (p.g-pal[c].g)**2 + (p.b-pal[c].b)**2;
+        if (d < bd) { bd = d; best = c; }
+      }
+      indices[i] = best;
+    }
+
+    palette = pal;
+  }
+
+  function getSourceCellSize() {
+    return { cellW: img.width / gridW, cellH: img.height / gridH };
+  }
+
+  function getFittedCellSize(maxGridW, maxGridH) {
+    const src = getSourceCellSize();
+    const scale = Math.min(maxGridW / img.width, maxGridH / img.height);
+    return {
+      cellW: src.cellW * scale,
+      cellH: src.cellH * scale,
+      drawW: img.width * scale,
+      drawH: img.height * scale,
+    };
+  }
+
+  function drawPixelatedPreview() {
+    if (!gridW || !gridH) return;
+    const fit = getFittedCellSize(420, 420);
+    const cellW = fit.cellW;
+    const cellH = fit.cellH;
+    const drawW = fit.drawW;
+    const drawH = fit.drawH;
+    pixCanvas.width = Math.max(1, Math.round(drawW));
+    pixCanvas.height = Math.max(1, Math.round(drawH));
+    pctx.clearRect(0,0,pixCanvas.width,pixCanvas.height);
+    for (let y = 0; y < gridH; y++) {
+      for (let x = 0; x < gridW; x++) {
+        const idx = indices[y * gridW + x];
+        pctx.fillStyle = palette[idx].hex;
+        pctx.fillRect(x * cellW, y * cellH, cellW, cellH);
+      }
+    }
+    pctx.strokeStyle = 'rgba(0,0,0,.35)';
+    pctx.lineWidth = 1;
+    for (let x = 0; x <= gridW; x++) {
+      const gx = x * cellW + 0.5;
+      pctx.beginPath(); pctx.moveTo(gx, 0); pctx.lineTo(gx, drawH); pctx.stroke();
+    }
+    for (let y = 0; y <= gridH; y++) {
+      const gy = y * cellH + 0.5;
+      pctx.beginPath(); pctx.moveTo(0, gy); pctx.lineTo(drawW, gy); pctx.stroke();
+    }
+  }
+
+  function findLargestRectangleInBlock(block) {
+    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+    for (const idx of block.cells) {
+      const [x, y] = unlin(idx);
+      if (x < minX) minX = x;
+      if (y < minY) minY = y;
+      if (x > maxX) maxX = x;
+      if (y > maxY) maxY = y;
+    }
+    const bw = maxX - minX + 1;
+    const bh = maxY - minY + 1;
+    const mask = new Array(bw * bh).fill(0);
+    for (const idx of block.cells) {
+      const [x, y] = unlin(idx);
+      mask[(y - minY) * bw + (x - minX)] = 1;
+    }
+    const heights = new Array(bw).fill(0);
+    let bestArea = 0;
+    let best = { x: 0, y: 0, w: 1, h: 1 };
+    for (let y = 0; y < bh; y++) {
+      for (let x = 0; x < bw; x++) heights[x] = mask[y * bw + x] ? heights[x] + 1 : 0;
+      const stack = [];
+      let x = 0;
+      while (x <= bw) {
+        const h = (x === bw) ? 0 : heights[x];
+        if (stack.length === 0 || h >= heights[stack[stack.length - 1]]) {
+          stack.push(x++);
+        } else {
+          const top = stack.pop();
+          const height = heights[top];
+          const width = stack.length === 0 ? x : x - stack[stack.length - 1] - 1;
+          const area = height * width;
+          if (area > bestArea && height > 0 && width > 0) {
+            bestArea = area;
+            const rectW = width;
+            const rectH = height;
+            const rectX = stack.length === 0 ? 0 : (stack[stack.length - 1] + 1);
+            const rectY = y - rectH + 1;
+            best = { x: rectX, y: rectY, w: rectW, h: rectH };
+          }
+        }
+      }
+    }
+    return { x: minX + best.x, y: minY + best.y, w: best.w, h: best.h };
+  }
+
+  // Same multi-seed region builder as the fixed generator the user preferred.
+  function buildTetrisRegions(targetSize = 4, randomness = 0.4) {
+    randomness = Math.max(0, Math.min(1, Number(randomness) || 0));
+    const compactness = 1 - randomness;
+    const minSize = Math.max(2, Math.floor(targetSize * (0.65 - 0.18 * randomness)));
+    const maxSize = Math.max(minSize + 1, Math.ceil(targetSize * (1.65 + 0.45 * randomness)));
+
+    blocks = [];
+    cellToBlock = new Array(gridW * gridH).fill(-1);
+
+    const inBounds = (x,y)=>(x>=0 && x<gridW && y>=0 && y<gridH);
+    const neighbors4 = (x,y)=>[[x-1,y],[x+1,y],[x,y-1],[x,y+1]].filter(([a,b])=>inBounds(a,b));
+
+    function shuffle(arr) {
+      for (let i = arr.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [arr[i], arr[j]] = [arr[j], arr[i]];
+      }
+      return arr;
+    }
+
+    function edgeShareCount(ci, regionSet) {
+      const [x,y] = unlin(ci);
+      let n = 0;
+      for (const [nx,ny] of neighbors4(x,y)) if (regionSet.has(lin(nx,ny))) n++;
+      return n;
+    }
+
+    function chooseSeeds(component, count) {
+      const seeds = [];
+      const seedSet = new Set();
+      const shuffled = shuffle(component.slice());
+      seeds.push(shuffled[0]);
+      seedSet.add(shuffled[0]);
+      while (seeds.length < count) {
+        let best = -1;
+        let bestScore = -1;
+        for (const ci of component) {
+          if (seedSet.has(ci)) continue;
+          const [x,y] = unlin(ci);
+          let minD = Infinity;
+          for (const si of seeds) {
+            const [sx,sy] = unlin(si);
+            const d = Math.abs(x-sx) + Math.abs(y-sy);
+            if (d < minD) minD = d;
+          }
+          const jitter = Math.random() * (0.2 + 1.2 * randomness);
+          const score = minD + jitter;
+          if (score > bestScore) { bestScore = score; best = ci; }
+        }
+        if (best === -1) break;
+        seeds.push(best);
+        seedSet.add(best);
+      }
+      return seeds;
+    }
+
+    function growComponentIntoRegions(component, colorIndex) {
+      if (component.length <= maxSize) return [{ colorIndex, cells: component.slice() }];
+
+      const regionCount = Math.max(1, Math.round(component.length / targetSize));
+      const seeds = chooseSeeds(component, regionCount);
+      const compSet = new Set(component);
+      const assignments = new Map();
+      const regions = seeds.map((seed) => {
+        const [sx, sy] = unlin(seed);
+        return {
+          colorIndex,
+          seed,
+          seedX: sx,
+          seedY: sy,
+          cells: [seed],
+          cellSet: new Set([seed]),
+          frontier: new Set(),
+          target: Math.max(minSize, Math.round(component.length / seeds.length + (Math.random()*2 - 1) * Math.max(1, targetSize * (0.12 + 0.38 * randomness))))
+        };
+      });
+
+      for (let i = 0; i < seeds.length; i++) assignments.set(seeds[i], i);
+
+      let totalTargets = regions.reduce((s,r)=>s+r.target, 0);
+      let leftover = component.length - totalTargets;
+      while (leftover > 0) { regions[Math.floor(Math.random() * regions.length)].target++; leftover--; }
+      while (leftover < 0) {
+        const candidates = regions.filter(r => r.target > minSize);
+        if (!candidates.length) break;
+        candidates[Math.floor(Math.random() * candidates.length)].target--;
+        leftover++;
+      }
+
+      for (let i = 0; i < regions.length; i++) {
+        const [sx, sy] = unlin(regions[i].seed);
+        for (const [nx, ny] of neighbors4(sx, sy)) {
+          const ni = lin(nx, ny);
+          if (compSet.has(ni) && !assignments.has(ni)) regions[i].frontier.add(ni);
+        }
+      }
+
+      const hasUnassignedNeighbor = (ci) => {
+        const [x,y] = unlin(ci);
+        for (const [nx,ny] of neighbors4(x,y)) {
+          const ni = lin(nx,ny);
+          if (compSet.has(ni) && !assignments.has(ni)) return true;
+        }
+        return false;
+      };
+
+      const candidateScore = (region, ci) => {
+        const [x,y] = unlin(ci);
+        const shared = edgeShareCount(ci, region.cellSet);
+        const distSeed = Math.abs(x-region.seedX) + Math.abs(y-region.seedY);
+        const boundsPenalty = Math.abs(region.cells.length - region.target) * (0.05 + 0.08 * compactness);
+        const rand = Math.random() * (0.12 + 1.2 * randomness);
+        return distSeed * (0.45 + 0.35 * compactness) - shared * (3.4 - 1.8 * randomness) + boundsPenalty + rand;
+      };
+
+      let guard = component.length * 20;
+      while (guard-- > 0 && assignments.size < component.length) {
+        let progressed = false;
+        const order = regions.map((r, i) => ({i, priority: (r.cells.length / Math.max(1, r.target)) + Math.random()*0.01}))
+          .sort((a,b)=>a.priority-b.priority).map(o=>o.i);
+
+        for (const ri of order) {
+          const region = regions[ri];
+          if (assignments.size >= component.length) break;
+          for (const ci of Array.from(region.frontier)) if (!compSet.has(ci) || assignments.has(ci)) region.frontier.delete(ci);
+
+          if (!region.frontier.size) {
+            for (const existing of region.cells) {
+              const [ex,ey] = unlin(existing);
+              if (!hasUnassignedNeighbor(existing)) continue;
+              for (const [nx,ny] of neighbors4(ex,ey)) {
+                const ni = lin(nx,ny);
+                if (compSet.has(ni) && !assignments.has(ni)) region.frontier.add(ni);
+              }
+            }
+          }
+
+          if (!region.frontier.size) continue;
+          const frontierScored = [];
+          for (const ci of region.frontier) frontierScored.push({ ci, sc: candidateScore(region, ci) });
+          frontierScored.sort((a, b) => a.sc - b.sc);
+          const topCount = Math.max(1, Math.min(frontierScored.length, 1 + Math.floor(randomness * 6)));
+          const pickIndex = Math.floor(Math.random() * topCount);
+          const best = frontierScored[pickIndex]?.ci ?? -1;
+          if (best === -1) continue;
+
+          assignments.set(best, ri);
+          region.cells.push(best);
+          region.cellSet.add(best);
+          region.frontier.delete(best);
+          const [bx, by] = unlin(best);
+          for (const [nx, ny] of neighbors4(bx, by)) {
+            const ni = lin(nx, ny);
+            if (compSet.has(ni) && !assignments.has(ni)) region.frontier.add(ni);
+          }
+          progressed = true;
+        }
+        if (!progressed) break;
+      }
+
+      const unassigned = component.filter(ci => !assignments.has(ci));
+      let leftovers = unassigned.slice();
+      let leftoverGuard = component.length * 10;
+      while (leftovers.length && leftoverGuard-- > 0) {
+        let any = false;
+        const nextLeft = [];
+        for (const ci of leftovers) {
+          const [x,y] = unlin(ci);
+          const counts = new Map();
+          for (const [nx,ny] of neighbors4(x,y)) {
+            const ni = lin(nx,ny);
+            if (assignments.has(ni)) {
+              const ri = assignments.get(ni);
+              counts.set(ri, (counts.get(ri) || 0) + 1);
+            }
+          }
+          if (!counts.size) { nextLeft.push(ci); continue; }
+
+          let bestRegion = -1;
+          let bestScore = -Infinity;
+          for (const [ri, shared] of counts.entries()) {
+            const region = regions[ri];
+            const [cx,cy] = unlin(ci);
+            const distSeed = Math.abs(cx-region.seedX) + Math.abs(cy-region.seedY);
+            const score = shared * (4 - 1.2 * randomness) - distSeed * (0.15 + 0.2 * compactness) - Math.max(0, region.cells.length - region.target) * 0.05 + Math.random() * randomness;
+            if (score > bestScore) { bestScore = score; bestRegion = ri; }
+          }
+          if (bestRegion >= 0) {
+            assignments.set(ci, bestRegion);
+            regions[bestRegion].cells.push(ci);
+            regions[bestRegion].cellSet.add(ci);
+            any = true;
+          } else nextLeft.push(ci);
+        }
+
+        if (!any) {
+          for (const ci of nextLeft) {
+            const [cx,cy] = unlin(ci);
+            let bestRegion = 0;
+            let bestD = Infinity;
+            for (let ri = 0; ri < regions.length; ri++) {
+              const d = Math.abs(cx - regions[ri].seedX) + Math.abs(cy - regions[ri].seedY);
+              if (d < bestD) { bestD = d; bestRegion = ri; }
+            }
+            assignments.set(ci, bestRegion);
+            regions[bestRegion].cells.push(ci);
+            regions[bestRegion].cellSet.add(ci);
+          }
+          break;
+        }
+        leftovers = nextLeft;
+      }
+
+      const regionAdjacency = () => {
+        const adj = Array.from({length: regions.length}, () => new Map());
+        for (const ci of component) {
+          const ri = assignments.get(ci);
+          const [x,y] = unlin(ci);
+          for (const [nx,ny] of neighbors4(x,y)) {
+            const ni = lin(nx,ny);
+            if (!compSet.has(ni)) continue;
+            const rj = assignments.get(ni);
+            if (ri === rj) continue;
+            adj[ri].set(rj, (adj[ri].get(rj) || 0) + 1);
+          }
+        }
+        return adj;
+      };
+
+      let merged = true;
+      while (merged) {
+        merged = false;
+        const adj = regionAdjacency();
+        for (let ri = 0; ri < regions.length; ri++) {
+          const region = regions[ri];
+          if (!region || region.cells.length === 0) continue;
+          if (region.cells.length >= minSize) continue;
+          let bestNeighbor = -1;
+          let bestScore = -Infinity;
+          for (const [rj, shared] of adj[ri].entries()) {
+            if (!regions[rj] || regions[rj].cells.length === 0) continue;
+            const score = shared * (5 - 1.5 * randomness) - Math.abs((regions[rj].cells.length + region.cells.length) - targetSize) * (0.08 + 0.08 * compactness) + Math.random() * randomness;
+            if (score > bestScore) { bestScore = score; bestNeighbor = rj; }
+          }
+          if (bestNeighbor >= 0) {
+            for (const ci of region.cells) {
+              assignments.set(ci, bestNeighbor);
+              regions[bestNeighbor].cells.push(ci);
+              regions[bestNeighbor].cellSet.add(ci);
+            }
+            region.cells = [];
+            region.cellSet = new Set();
+            merged = true;
+          }
+        }
+      }
+
+      const smoothingPasses = Math.max(0, Math.round(4 - 3 * randomness));
+      for (let pass = 0; pass < smoothingPasses; pass++) {
+        const proposed = new Map();
+        for (const ci of component) {
+          const ri = assignments.get(ci);
+          const [x,y] = unlin(ci);
+          let same = 0;
+          const counts = new Map();
+          for (const [nx,ny] of neighbors4(x,y)) {
+            const ni = lin(nx,ny);
+            if (!compSet.has(ni)) continue;
+            const rj = assignments.get(ni);
+            if (rj === ri) same++;
+            else counts.set(rj, (counts.get(rj) || 0) + 1);
+          }
+          if (same <= 1 && counts.size) {
+            let bestRegion = -1;
+            let bestCount = 0;
+            for (const [rj, c] of counts.entries()) {
+              if (c > bestCount && regions[rj] && regions[rj].cells.length >= minSize) {
+                bestCount = c;
+                bestRegion = rj;
+              }
+            }
+            if (bestRegion >= 0 && bestCount >= 2) proposed.set(ci, bestRegion);
+          }
+        }
+        if (!proposed.size) break;
+        for (const [ci, newRegion] of proposed.entries()) {
+          const oldRegion = assignments.get(ci);
+          if (oldRegion === newRegion) continue;
+          assignments.set(ci, newRegion);
+        }
+        regions.forEach(r => { r.cells = []; r.cellSet = new Set(); });
+        for (const ci of component) {
+          const ri = assignments.get(ci);
+          regions[ri].cells.push(ci);
+          regions[ri].cellSet.add(ci);
+        }
+      }
+
+      return regions.filter(r => r.cells.length > 0).map(r => ({ colorIndex, cells: r.cells.slice() }));
+    }
+
+    const visited = new Uint8Array(gridW * gridH);
+    for (let y=0; y<gridH; y++) {
+      for (let x=0; x<gridW; x++) {
+        const seed = lin(x,y);
+        if (visited[seed]) continue;
+        const colorIndex = indices[seed];
+        const q = [seed];
+        visited[seed] = 1;
+        const component = [];
+
+        while (q.length) {
+          const ci = q.pop();
+          component.push(ci);
+          const [cx,cy] = unlin(ci);
+          for (const [nx,ny] of neighbors4(cx,cy)) {
+            const ni = lin(nx,ny);
+            if (!visited[ni] && indices[ni] === colorIndex) {
+              visited[ni] = 1;
+              q.push(ni);
+            }
+          }
+        }
+
+        const parts = growComponentIntoRegions(component, colorIndex);
+        for (const part of parts) blocks.push(part);
+      }
+    }
+
+    blocks.forEach((b, bi) => b.cells.forEach(ci => { cellToBlock[ci] = bi; }));
+    for (let i = 0; i < gridW * gridH; i++) {
+      if (cellToBlock[i] === -1) {
+        const bi = blocks.length;
+        blocks.push({ colorIndex: indices[i], cells: [i] });
+        cellToBlock[i] = bi;
+      }
+    }
+    for (const b of blocks) b.rect = findLargestRectangleInBlock(b);
+  }
+
+  function getExportCellSize() {
+    const src = getSourceCellSize();
+    const minCellTarget = 10;
+    let scale = Math.max(minCellTarget / Math.min(src.cellW, src.cellH), 1);
+    const maxSide = 1800;
+    if (Math.max(img.width * scale, img.height * scale) > maxSide) scale = maxSide / Math.max(img.width, img.height);
+    const cellW = Math.max(4, Math.round(src.cellW * scale));
+    const cellH = Math.max(4, Math.round(src.cellH * scale));
+    return { cellW, cellH, drawW: cellW * gridW, drawH: cellH * gridH };
+  }
+
+  function renderRegionCanvas(mode) {
+    const border = Math.max(1, Math.min(8, parseInt(borderPxEl.value, 10) || 2));
+    const { cellW, cellH, drawW, drawH } = getExportCellSize();
+    const c = document.createElement('canvas');
+    c.width = drawW;
+    c.height = drawH;
+    const ctx = c.getContext('2d');
+    ctx.imageSmoothingEnabled = false;
+
+    ctx.fillStyle = '#ffffff';
+    ctx.fillRect(0, 0, drawW, drawH);
+
+    for (let bi = 0; bi < blocks.length; bi++) {
+      const block = blocks[bi];
+      ctx.fillStyle = (mode === 'colored') ? palette[block.colorIndex].hex : '#ffffff';
+      for (const ci of block.cells) {
+        const [cx, cy] = unlin(ci);
+        ctx.fillRect(cx * cellW, cy * cellH, cellW, cellH);
+      }
+    }
+
+    ctx.fillStyle = '#000000';
+    for (let bi = 0; bi < blocks.length; bi++) {
+      const block = blocks[bi];
+      for (const ci of block.cells) {
+        const [cx, cy] = unlin(ci);
+        const x0 = cx * cellW;
+        const y0 = cy * cellH;
+        const top = cy > 0 ? cellToBlock[lin(cx, cy - 1)] : -2;
+        const right = cx < gridW - 1 ? cellToBlock[lin(cx + 1, cy)] : -2;
+        const bottom = cy < gridH - 1 ? cellToBlock[lin(cx, cy + 1)] : -2;
+        const left = cx > 0 ? cellToBlock[lin(cx - 1, cy)] : -2;
+
+        if (top !== bi) ctx.fillRect(x0, y0, cellW, border);
+        if (bottom !== bi) ctx.fillRect(x0, y0 + cellH - border, cellW, border);
+        if (left !== bi) ctx.fillRect(x0, y0, border, cellH);
+        if (right !== bi) ctx.fillRect(x0 + cellW - border, y0, border, cellH);
+      }
+    }
+
+    ctx.fillRect(0, 0, drawW, border);
+    ctx.fillRect(0, drawH - border, drawW, border);
+    ctx.fillRect(0, 0, border, drawH);
+    ctx.fillRect(drawW - border, 0, border, drawH);
+    return c;
+  }
+
+  function downloadDataURL(filename, dataURL) {
+    const a = document.createElement('a');
+    a.href = dataURL;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+  }
+
+  const drop = document.getElementById('drop');
+  const file = document.getElementById('file');
+  drop.addEventListener('click', () => file.click());
+
+  function handleFiles(files) {
+    if (!files || !files[0]) return;
+    const url = URL.createObjectURL(files[0]);
+    const imgNew = new Image();
+    imgNew.onload = () => {
+      img = imgNew;
+      imgLoaded = true;
+      drawOrigFit();
+      blankPreviewImg.removeAttribute('src');
+      coloredPreviewImg.removeAttribute('src');
+      btnDownloadBlank.disabled = true;
+      btnDownloadColored.disabled = true;
+      URL.revokeObjectURL(url);
+    };
+    imgNew.onerror = () => alert('Could not load that image.');
+    imgNew.src = url;
+  }
+
+  drop.addEventListener('dragover', e => { e.preventDefault(); drop.classList.add('drag'); });
+  drop.addEventListener('dragleave', () => drop.classList.remove('drag'));
+  drop.addEventListener('drop', e => { e.preventDefault(); drop.classList.remove('drag'); handleFiles(e.dataTransfer.files); });
+  file.addEventListener('change', e => handleFiles(e.target.files));
+
+  document.getElementById('btnPixelate').addEventListener('click', () => {
+    if (!imgLoaded) { alert('Please upload an image first.'); return; }
+    const W = parseInt(colsEl.value, 10) || 24;
+    const H = parseInt(rowsEl.value, 10) || 24;
+    const K = parseInt(kEl.value, 10) || 2;
+    sampleToGrid(W, H);
+    clusterQuantize(K);
+    drawPixelatedPreview();
+    blankPreviewImg.removeAttribute('src');
+    coloredPreviewImg.removeAttribute('src');
+    btnDownloadBlank.disabled = true;
+    btnDownloadColored.disabled = true;
+  });
+
+  document.getElementById('btnGenerate').addEventListener('click', () => {
+    if (!imgLoaded || !indices.length) { alert('Pixelate the image first.'); return; }
+    let targetSize = parseInt(targetRegionEl.value, 10);
+    if (isNaN(targetSize) || targetSize < 1) targetSize = 4;
+    targetSize = Math.min(Math.max(1, targetSize), gridW * gridH);
+    const randomness = (parseInt(randomnessEl.value, 10) || 0) / 100;
+    buildTetrisRegions(targetSize, randomness);
+
+    const blankCanvas = renderRegionCanvas('blank');
+    const coloredCanvas = renderRegionCanvas('colored');
+    blankURL = blankCanvas.toDataURL('image/png');
+    coloredURL = coloredCanvas.toDataURL('image/png');
+    blankPreviewImg.src = blankURL;
+    coloredPreviewImg.src = coloredURL;
+    btnDownloadBlank.disabled = false;
+    btnDownloadColored.disabled = false;
+    blankPreviewImg.scrollIntoView({ behavior:'smooth', block:'center' });
+  });
+
+  btnDownloadBlank.addEventListener('click', () => { if (blankURL) downloadDataURL('blank_regions.png', blankURL); });
+  btnDownloadColored.addEventListener('click', () => { if (coloredURL) downloadDataURL('colored_regions.png', coloredURL); });
+
+  origCanvas.width = 360; origCanvas.height = 240;
+  pixCanvas.width = 360; pixCanvas.height = 240;
+})();
+</script>
+</body>
+</html>
